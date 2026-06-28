@@ -1,0 +1,360 @@
+basePath: /
+definitions:
+  controllers.AddAccountRequest:
+    properties:
+      phone_number:
+        example: "628123456789"
+        type: string
+    type: object
+  controllers.AddAccountResponse:
+    properties:
+      message:
+        example: Scan this QR code with WhatsApp
+        type: string
+      qr_code:
+        example: data:image/png;base64,iVBORw0KGgoAAA...
+        type: string
+    type: object
+  controllers.ErrorResponse:
+    properties:
+      error:
+        example: error description
+        type: string
+    type: object
+  controllers.GenerateApiKeyRequest:
+    properties:
+      app_name:
+        example: Aplikasi Antrean
+        type: string
+    type: object
+  controllers.MessageResponse:
+    properties:
+      message:
+        example: Success
+        type: string
+    type: object
+  controllers.SendMessageRequest:
+    properties:
+      caption:
+        example: Ini adalah caption foto
+        type: string
+      image_base64:
+        example: data:image/png;base64,iVBORw0KGgoAAA...
+        type: string
+      image_url:
+        example: https://example.com/image.jpg
+        type: string
+      message:
+        example: Halo, ini adalah pesan uji coba.
+        type: string
+      sender_number:
+        example: "628987654321"
+        type: string
+      to:
+        example: "628123456789"
+        type: string
+    type: object
+  controllers.ValoAccountsResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/models.ValoAccount'
+        type: array
+    type: object
+  controllers.ValoApiKeyResponse:
+    properties:
+      data:
+        $ref: '#/definitions/models.ValoApiKey'
+    type: object
+  controllers.ValoApiKeysResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/models.ValoApiKey'
+        type: array
+    type: object
+  models.ValoAccount:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      is_default:
+        type: boolean
+      phone_number:
+        description: e.g., 6281234567890
+        type: string
+      status:
+        description: DISCONNECTED, CONNECTED
+        type: string
+      updated_at:
+        type: string
+    type: object
+  models.ValoApiKey:
+    properties:
+      app_name:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      is_active:
+        type: boolean
+      key:
+        description: Pre-generated API Key
+        type: string
+      updated_at:
+        type: string
+    type: object
+host: localhost:8083
+info:
+  contact:
+    email: support@valoengine.io
+    name: API Support
+  description: Decoupled standalone microservice for Valo Engine (WhatsApp Bot & Messaging).
+  license:
+    name: Apache 2.0
+    url: http://www.apache.org/licenses/LICENSE-2.0.html
+  termsOfService: http://swagger.io/terms/
+  title: Valo Engine API
+  version: "1.0"
+paths:
+  /valo/accounts:
+    get:
+      description: Retrieve a list of all WhatsApp accounts connected to Valo engine
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Success
+          schema:
+            $ref: '#/definitions/controllers.ValoAccountsResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: List WhatsApp accounts
+      tags:
+      - Valo Engine
+  /valo/accounts/{phone_number}/default:
+    post:
+      description: Set a WhatsApp account as the default fallback for sending messages
+      parameters:
+      - description: Phone Number
+        in: path
+        name: phone_number
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Success
+          schema:
+            $ref: '#/definitions/controllers.MessageResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Set default WhatsApp account
+      tags:
+      - Valo Engine
+  /valo/accounts/{phone_number}/logout:
+    post:
+      description: Log out a WhatsApp account and terminate its active session
+      parameters:
+      - description: Phone Number
+        in: path
+        name: phone_number
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Success
+          schema:
+            $ref: '#/definitions/controllers.MessageResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Logout WhatsApp account
+      tags:
+      - Valo Engine
+  /valo/accounts/add:
+    post:
+      consumes:
+      - application/json
+      description: Initiate pairing for a WhatsApp phone number and return the QR
+        Code
+      parameters:
+      - description: Add Account Request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/controllers.AddAccountRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Success
+          schema:
+            $ref: '#/definitions/controllers.AddAccountResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Add WhatsApp account / Get QR
+      tags:
+      - Valo Engine
+  /valo/apikeys:
+    get:
+      description: Get all API keys generated for third-party integration
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Success
+          schema:
+            $ref: '#/definitions/controllers.ValoApiKeysResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: List API Keys
+      tags:
+      - Valo Engine
+    post:
+      consumes:
+      - application/json
+      description: Generate a new API Key for third-party applications to access public
+        endpoints
+      parameters:
+      - description: Generate API Key Request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/controllers.GenerateApiKeyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Success
+          schema:
+            $ref: '#/definitions/controllers.ValoApiKeyResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Generate API Key
+      tags:
+      - Valo Engine
+  /valo/apikeys/{id}:
+    delete:
+      description: Soft-delete an API key from the database by ID
+      parameters:
+      - description: API Key ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Success
+          schema:
+            $ref: '#/definitions/controllers.MessageResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Delete API Key
+      tags:
+      - Valo Engine
+  /valo/messages/send:
+    post:
+      consumes:
+      - application/json
+      description: Send a WhatsApp message (text and/or photo) to a recipient. Authentication
+        via X-Valo-Key header is required.
+      parameters:
+      - description: Send Message Request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/controllers.SendMessageRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Success
+          schema:
+            $ref: '#/definitions/controllers.MessageResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/controllers.ErrorResponse'
+      security:
+      - ValoApiKey: []
+      summary: Send WhatsApp message
+      tags:
+      - Valo Engine
+securityDefinitions:
+  BearerAuth:
+    description: Enter Bearer token for Valo Engine admin endpoints
+    in: header
+    name: Authorization
+    type: apiKey
+  ValoApiKey:
+    description: Enter valid API key for Valo Engine public messaging endpoints
+    in: header
+    name: X-Valo-Key
+    type: apiKey
+swagger: "2.0"
