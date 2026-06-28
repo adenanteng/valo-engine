@@ -6,8 +6,7 @@ import (
 	"valo-engine/internal/services"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/gofiber/fiber/v3/middleware/adaptor"
-	httpSwagger "github.com/swaggo/http-swagger"
+	"github.com/gofiber/contrib/v3/swaggo"
 	"gorm.io/gorm"
 )
 
@@ -17,8 +16,8 @@ func RegisterRoutes(app *fiber.App, db *gorm.DB, valoService *services.ValoServi
 	publicController := controllers.NewValoPublicController(valoService)
 
 	// Swagger UI
-	app.Get("/swagger/*", adaptor.HTTPHandler(httpSwagger.WrapHandler))
-	app.Get("/api/swagger/*", adaptor.HTTPHandler(httpSwagger.WrapHandler))
+	app.Get("/swagger/*", swaggo.HandlerDefault)
+	app.Get("/api/swagger/*", swaggo.HandlerDefault)
 
 	// Health check
 	healthHandler := func(c fiber.Ctx) error {
