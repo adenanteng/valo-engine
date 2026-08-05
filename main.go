@@ -60,7 +60,14 @@ func main() {
 	}
 
 	// 2. Initialize Valo Service
-	valoService := services.NewValoService(db)
+	valoService := services.NewValoService(db, cfg)
+
+	// Log Aria WhatsApp status
+	if cfg.AriaWhatsAppNumber != "" {
+		log.Printf("🤖 Aria WhatsApp chatbot enabled for number: %s", cfg.AriaWhatsAppNumber)
+	} else {
+		log.Println("ℹ️  Aria WhatsApp chatbot disabled (ARIA_WHATSAPP_NUMBER not set)")
+	}
 
 	// 3. Initialize Fiber App
 	app := fiber.New(fiber.Config{

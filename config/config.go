@@ -20,9 +20,12 @@ type Config struct {
 	DBPassword string
 	DBName     string
 	DBSSLMode  string
-	Port         string
-	Timezone     string
-	ValoAdminKey string
+	Port               string
+	Timezone           string
+	ValoAdminKey       string
+	GrupiaAPIURL       string
+	GrupiaWebhookKey   string
+	AriaWhatsAppNumber string
 }
 
 // LoadConfig loads configuration from environment variables
@@ -38,9 +41,12 @@ func LoadConfig() (*Config, error) {
 		DBPassword:   getEnv("DATABASE_PASSWORD", ""),
 		DBName:       getEnv("DATABASE_NAME", "valo_engine"),
 		DBSSLMode:    getEnv("DATABASE_SSL", "disable"),
-		Port:         getEnv("PORT", "8083"),
-		Timezone:     getEnv("TIMEZONE", "Asia/Jakarta"),
-		ValoAdminKey: getEnv("VALO_ADMIN_KEY", ""),
+		Port:               getEnv("PORT", "8083"),
+		Timezone:           getEnv("TIMEZONE", "Asia/Jakarta"),
+		ValoAdminKey:       getEnv("VALO_ADMIN_KEY", ""),
+		GrupiaAPIURL:       getEnv("GRUPIA_API_URL", ""),
+		GrupiaWebhookKey:   getEnv("GRUPIA_WEBHOOK_KEY", ""),
+		AriaWhatsAppNumber: getEnv("ARIA_WHATSAPP_NUMBER", ""),
 	}, nil
 }
 
