@@ -2,6 +2,10 @@ basePath: /
 definitions:
   controllers.AddAccountRequest:
     properties:
+      method:
+        description: '"qr" or "pair_code"'
+        example: qr
+        type: string
       phone_number:
         example: "628123456789"
         type: string
@@ -9,7 +13,10 @@ definitions:
   controllers.AddAccountResponse:
     properties:
       message:
-        example: Scan this QR code with WhatsApp
+        example: Scan this QR code or enter pairing code in WhatsApp
+        type: string
+      pairing_code:
+        example: ABCD-1234
         type: string
       qr_code:
         example: data:image/png;base64,iVBORw0KGgoAAA...
@@ -197,7 +204,7 @@ paths:
       consumes:
       - application/json
       description: Initiate pairing for a WhatsApp phone number and return the QR
-        Code
+        Code or 8-digit Pairing Code
       parameters:
       - description: Add Account Request
         in: body
@@ -226,7 +233,7 @@ paths:
             $ref: '#/definitions/controllers.ErrorResponse'
       security:
       - BearerAuth: []
-      summary: Add WhatsApp account / Get QR
+      summary: Add WhatsApp account / Get QR or Pairing Code
       tags:
       - Valo Engine
   /valo/apikeys:
@@ -351,6 +358,11 @@ securityDefinitions:
     description: Enter Bearer token for Valo Engine admin endpoints
     in: header
     name: Authorization
+    type: apiKey
+  ValoAdminKey:
+    description: Enter Master Admin Key for Valo Engine admin endpoints
+    in: header
+    name: X-Valo-Admin-Key
     type: apiKey
   ValoApiKey:
     description: Enter valid API key for Valo Engine public messaging endpoints

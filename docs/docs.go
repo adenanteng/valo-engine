@@ -61,7 +61,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Initiate pairing for a WhatsApp phone number and return the QR Code",
+                "description": "Initiate pairing for a WhatsApp phone number and return the QR Code or 8-digit Pairing Code",
                 "consumes": [
                     "application/json"
                 ],
@@ -71,7 +71,7 @@ const docTemplate = `{
                 "tags": [
                     "Valo Engine"
                 ],
-                "summary": "Add WhatsApp account / Get QR",
+                "summary": "Add WhatsApp account / Get QR or Pairing Code",
                 "parameters": [
                     {
                         "description": "Add Account Request",
@@ -385,6 +385,11 @@ const docTemplate = `{
         "controllers.AddAccountRequest": {
             "type": "object",
             "properties": {
+                "method": {
+                    "description": "\"qr\" or \"pair_code\"",
+                    "type": "string",
+                    "example": "qr"
+                },
                 "phone_number": {
                     "type": "string",
                     "example": "628123456789"
@@ -396,7 +401,11 @@ const docTemplate = `{
             "properties": {
                 "message": {
                     "type": "string",
-                    "example": "Scan this QR code with WhatsApp"
+                    "example": "Scan this QR code or enter pairing code in WhatsApp"
+                },
+                "pairing_code": {
+                    "type": "string",
+                    "example": "ABCD-1234"
                 },
                 "qr_code": {
                     "type": "string",
@@ -545,6 +554,12 @@ const docTemplate = `{
             "description": "Enter Bearer token for Valo Engine admin endpoints",
             "type": "apiKey",
             "name": "Authorization",
+            "in": "header"
+        },
+        "ValoAdminKey": {
+            "description": "Enter Master Admin Key for Valo Engine admin endpoints",
+            "type": "apiKey",
+            "name": "X-Valo-Admin-Key",
             "in": "header"
         },
         "ValoApiKey": {

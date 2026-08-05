@@ -216,16 +216,23 @@ func (s *ValoService) startClient(deviceStore *store.Device, phoneNumber string)
 	s.clientsMutex.Unlock()
 }
 
-func (s *ValoService) GetQR(phoneNumber string) (string, error) {
-	s.clientsMutex.RLock()
-	client, exists := s.clients[phoneNumber]
-	s.clientsMutex.RUnlock()
+func (s *ValoService) getOrCreateFreshClient(phoneNumber string) (*whatsmeow.Client, error) {
+	s.clientsMutex.Lock()
+	defer s.clientsMutex.Unlock()
 
-	if exists && client.IsConnected() && client.IsLoggedIn() {
-		return "", fmt.Errorf("already logged in")
+	if existingClient, exists := s.clients[phoneNumber]; exists {
+		if existingClient.IsConnected() && existingClient.IsLoggedIn() {
+			return nil, fmt.Errorf("already logged in")
+		}
+		// Clean up old / stale / disconnected / deleted client
+		existingClient.Disconnect()
+		if existingClient.Store != nil {
+			_ = existingClient.Store.Delete(context.Background())
+		}
+		delete(s.clients, phoneNumber)
 	}
 
-	// Create new account if doesn't exist
+	// Create new account record if doesn't exist
 	var account models.ValoAccount
 	res := s.db.Where("phone_number = ?", phoneNumber).First(&account)
 	if res.Error != nil {
@@ -236,17 +243,21 @@ func (s *ValoService) GetQR(phoneNumber string) (string, error) {
 		s.db.Create(&account)
 	}
 
-	if !exists {
-		deviceStore := s.container.NewDevice()
-		client = s.createAndRegisterClient(deviceStore, phoneNumber)
+	deviceStore := s.container.NewDevice()
+	client := s.createAndRegisterClient(deviceStore, phoneNumber)
+	s.clients[phoneNumber] = client
 
-		s.clientsMutex.Lock()
-		s.clients[phoneNumber] = client
-		s.clientsMutex.Unlock()
+	return client, nil
+}
+
+func (s *ValoService) GetQR(phoneNumber string) (string, error) {
+	client, err := s.getOrCreateFreshClient(phoneNumber)
+	if err != nil {
+		return "", err
 	}
 
 	qrChan, _ := client.GetQRChannel(context.Background())
-	err := client.Connect()
+	err = client.Connect()
 	if err != nil {
 		return "", err
 	}
@@ -275,6 +286,43 @@ func (s *ValoService) GetQR(phoneNumber string) (string, error) {
 	}
 
 	return "", fmt.Errorf("failed to get QR")
+}
+
+func (s *ValoService) GetPairingCode(phoneNumber string) (string, error) {
+	client, err := s.getOrCreateFreshClient(phoneNumber)
+	if err != nil {
+		return "", err
+	}
+
+	qrChan, _ := client.GetQRChannel(context.Background())
+	err = client.Connect()
+	if err != nil {
+		return "", err
+	}
+
+	select {
+	case qrEvent := <-qrChan:
+		if qrEvent.Event == "code" || qrEvent.Event == "success" {
+			code, err := client.PairPhone(context.Background(), phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+			if err != nil {
+				return "", fmt.Errorf("failed to get pairing code: %w", err)
+			}
+
+			go func() {
+				for evt := range qrChan {
+					if evt.Event == "success" {
+						s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", phoneNumber).Update("status", "CONNECTED")
+					}
+				}
+			}()
+
+			return code, nil
+		}
+	case <-time.After(15 * time.Second):
+		return "", fmt.Errorf("timeout waiting for connection")
+	}
+
+	return "", fmt.Errorf("failed to get pairing code")
 }
 
 func (s *ValoService) SendMessage(senderNumber string, to string, message string, imageUrl string, imageBase64 string, caption string) error {
@@ -406,22 +454,20 @@ func (s *ValoService) SendMessage(senderNumber string, to string, message string
 }
 
 func (s *ValoService) Logout(phoneNumber string) error {
-	s.clientsMutex.RLock()
-	client, exists := s.clients[phoneNumber]
-	s.clientsMutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("client not found")
-	}
-
-	err := client.Logout(context.Background())
-	if err != nil {
-		return err
-	}
-
 	s.clientsMutex.Lock()
-	delete(s.clients, phoneNumber)
+	client, exists := s.clients[phoneNumber]
+	if exists {
+		delete(s.clients, phoneNumber)
+	}
 	s.clientsMutex.Unlock()
+
+	if exists && client != nil {
+		_ = client.Logout(context.Background())
+		client.Disconnect()
+		if client.Store != nil {
+			_ = client.Store.Delete(context.Background())
+		}
+	}
 
 	s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", phoneNumber).Update("status", "DISCONNECTED")
 	return nil

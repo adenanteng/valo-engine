@@ -13,11 +13,13 @@ import (
 
 type AddAccountRequest struct {
 	PhoneNumber string `json:"phone_number" example:"628123456789"`
+	Method      string `json:"method" example:"qr"` // "qr" or "pair_code"
 }
 
 type AddAccountResponse struct {
-	QrCode  string `json:"qr_code" example:"data:image/png;base64,iVBORw0KGgoAAA..."`
-	Message string `json:"message" example:"Scan this QR code with WhatsApp"`
+	QrCode      string `json:"qr_code,omitempty" example:"data:image/png;base64,iVBORw0KGgoAAA..."`
+	PairingCode string `json:"pairing_code,omitempty" example:"ABCD-1234"`
+	Message     string `json:"message" example:"Scan this QR code or enter pairing code in WhatsApp"`
 }
 
 type GenerateApiKeyRequest struct {
@@ -71,9 +73,9 @@ func (c *ValoAdminController) ListAccounts(ctx fiber.Ctx) error {
 	return ctx.JSON(fiber.Map{"data": accounts})
 }
 
-// AddAccount initiates WhatsApp pairing and gets QR
-// @Summary Add WhatsApp account / Get QR
-// @Description Initiate pairing for a WhatsApp phone number and return the QR Code
+// AddAccount initiates WhatsApp pairing (QR Code or Pairing Code)
+// @Summary Add WhatsApp account / Get QR or Pairing Code
+// @Description Initiate pairing for a WhatsApp phone number and return the QR Code or 8-digit Pairing Code
 // @Tags Valo Engine
 // @Accept json
 // @Produce json
@@ -88,6 +90,17 @@ func (c *ValoAdminController) AddAccount(ctx fiber.Ctx) error {
 	var req AddAccountRequest
 	if err := ctx.Bind().JSON(&req); err != nil {
 		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	if req.Method == "pair_code" {
+		code, err := c.valoService.GetPairingCode(req.PhoneNumber)
+		if err != nil {
+			return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		return ctx.JSON(fiber.Map{
+			"pairing_code": code,
+			"message":      "Enter this pairing code in WhatsApp (Linked Devices > Link with phone number)",
+		})
 	}
 
 	qr, err := c.valoService.GetQR(req.PhoneNumber)
