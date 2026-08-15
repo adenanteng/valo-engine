@@ -26,6 +26,7 @@ type Config struct {
 	GrupiaAPIURL       string
 	GrupiaWebhookKey   string
 	AriaWhatsAppNumber string
+	WhatsAppProxyURL   string
 }
 
 // LoadConfig loads configuration from environment variables
@@ -47,6 +48,7 @@ func LoadConfig() (*Config, error) {
 		GrupiaAPIURL:       getEnv("GRUPIA_API_URL", ""),
 		GrupiaWebhookKey:   getEnv("GRUPIA_WEBHOOK_KEY", ""),
 		AriaWhatsAppNumber: getEnv("ARIA_WHATSAPP_NUMBER", ""),
+		WhatsAppProxyURL:   getEnv("WHATSAPP_PROXY_URL", ""),
 	}, nil
 }
 

@@ -37,6 +37,7 @@ type ValoService struct {
 	grupiaAPIURL       string
 	grupiaWebhookKey   string
 	ariaWhatsAppNumber string
+	whatsAppProxyURL   string
 }
 
 func NewValoService(db *gorm.DB, cfg *config.Config) *ValoService {
@@ -67,6 +68,7 @@ func NewValoService(db *gorm.DB, cfg *config.Config) *ValoService {
 		grupiaAPIURL:       cfg.GrupiaAPIURL,
 		grupiaWebhookKey:   cfg.GrupiaWebhookKey,
 		ariaWhatsAppNumber: cfg.AriaWhatsAppNumber,
+		whatsAppProxyURL:   cfg.WhatsAppProxyURL,
 	}
 
 	svc.initExistingClients()
@@ -111,6 +113,14 @@ func (s *ValoService) initExistingClients() {
 func (s *ValoService) createAndRegisterClient(deviceStore *store.Device, phoneNumber string) *whatsmeow.Client {
 	clientLog := waLog.Stdout("Client", "WARN", true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
+
+	if s.whatsAppProxyURL != "" {
+		if err := client.SetProxyAddress(s.whatsAppProxyURL); err != nil {
+			log.Printf("[Valo] Invalid WHATSAPP_PROXY_URL for %s: %v", phoneNumber, err)
+		} else {
+			log.Printf("[Valo] Using proxy for %s", phoneNumber)
+		}
+	}
 
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
