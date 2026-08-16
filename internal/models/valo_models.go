@@ -12,7 +12,8 @@ type ValoAccount struct {
 	ID          uuid.UUID      `gorm:"type:uuid;primaryKey;default:uuid_generate_v4()" json:"id"`
 	PhoneNumber string         `gorm:"type:varchar(50);uniqueIndex;not null" json:"phone_number"` // e.g., 6281234567890
 	IsDefault   bool           `gorm:"default:false" json:"is_default"`
-	Status      string         `gorm:"type:varchar(20);default:'DISCONNECTED'" json:"status"` // DISCONNECTED, CONNECTED
+	Status      string         `gorm:"type:varchar(20);default:'DISCONNECTED'" json:"status"` // CONNECTED, DISCONNECTED, LOGGED_OUT (needs re-pair), TEMP_BANNED (wait out expiry)
+	ProxyURL    string         `gorm:"type:varchar(255)" json:"proxy_url"`                    // optional per-account SOCKS5 proxy; overrides WHATSAPP_PROXY_URL
 	CreatedAt   time.Time      `json:"created_at"`
 	UpdatedAt   time.Time      `json:"updated_at"`
 	DeletedAt   gorm.DeletedAt `gorm:"index" json:"-"`

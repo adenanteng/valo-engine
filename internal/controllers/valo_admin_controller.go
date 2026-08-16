@@ -68,6 +68,9 @@ func NewValoAdminController(db *gorm.DB, valoService *services.ValoService) *Val
 // @Security BearerAuth
 // @Router /valo/accounts [get]
 func (c *ValoAdminController) ListAccounts(ctx fiber.Ctx) error {
+	// Reconcile DB statuses with live clients first — events alone can leave
+	// stale statuses (missed while down, half-dead sockets, etc).
+	c.valoService.SyncStatuses()
 	var accounts []models.ValoAccount
 	c.db.Find(&accounts)
 	return ctx.JSON(fiber.Map{"data": accounts})

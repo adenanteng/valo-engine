@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -29,11 +30,37 @@ import (
 	"gorm.io/gorm"
 )
 
+// Account statuses stored in valo_accounts.status.
+// whatsmeow auto-reconnects on plain Disconnected; LOGGED_OUT / TEMP_BANNED
+// come from PermanentDisconnect events where it will NOT reconnect.
+const (
+	StatusConnected    = "CONNECTED"
+	StatusDisconnected = "DISCONNECTED"
+	StatusLoggedOut    = "LOGGED_OUT"
+	StatusTempBanned   = "TEMP_BANNED"
+)
+
+// Sends via the public API are spaced per account to avoid spam flags.
+// ponytail: blocking pacing — swap for a real queue if API callers need instant responses.
+var (
+	sendMinGap = 4 * time.Second
+	sendJitter = 6 * time.Second
+)
+
+// sendPacer serializes and spaces outbound sends for one account.
+// ponytail: sleeps while holding the lock (that's what serializes sends); global per-account only.
+type sendPacer struct {
+	mu   sync.Mutex
+	next time.Time
+}
+
 type ValoService struct {
 	db                 *gorm.DB
 	container          *sqlstore.Container
 	clients            map[string]*whatsmeow.Client
 	clientsMutex       sync.RWMutex
+	pacers             map[string]*sendPacer
+	pacersMutex        sync.Mutex
 	grupiaAPIURL       string
 	grupiaWebhookKey   string
 	ariaWhatsAppNumber string
@@ -65,6 +92,7 @@ func NewValoService(db *gorm.DB, cfg *config.Config) *ValoService {
 		db:                 db,
 		container:          container,
 		clients:            make(map[string]*whatsmeow.Client),
+		pacers:             make(map[string]*sendPacer),
 		grupiaAPIURL:       cfg.GrupiaAPIURL,
 		grupiaWebhookKey:   cfg.GrupiaWebhookKey,
 		ariaWhatsAppNumber: cfg.AriaWhatsAppNumber,
@@ -88,7 +116,7 @@ func normalizePhoneNumber(number string) string {
 
 func (s *ValoService) initExistingClients() {
 	var accounts []models.ValoAccount
-	s.db.Where("status = ?", "CONNECTED").Find(&accounts)
+	s.db.Find(&accounts)
 
 	devices, err := s.container.GetAllDevices(context.Background())
 	if err != nil {
@@ -98,14 +126,23 @@ func (s *ValoService) initExistingClients() {
 
 	for _, account := range accounts {
 		normAccountNum := normalizePhoneNumber(account.PhoneNumber)
+		found := false
 		for _, device := range devices {
 			if device.ID != nil {
 				normDeviceUser := normalizePhoneNumber(device.ID.User)
-				if normDeviceUser == normAccountNum || strings.HasPrefix(device.ID.String(), account.PhoneNumber) {
+				if normDeviceUser == normAccountNum || strings.HasPrefix(device.ID.String(), normAccountNum) {
+					// Connect every account that still has a session; the event
+					// handler writes the real status (Connected/LoggedOut/etc).
 					s.startClient(device, account.PhoneNumber)
+					found = true
 					break
 				}
 			}
+		}
+		// DB says connected but the session is gone (e.g. logged out while we
+		// were down) — pairing is dead, needs re-add.
+		if !found && account.Status == StatusConnected {
+			s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", account.PhoneNumber).Update("status", StatusLoggedOut)
 		}
 	}
 }
@@ -114,11 +151,18 @@ func (s *ValoService) createAndRegisterClient(deviceStore *store.Device, phoneNu
 	clientLog := waLog.Stdout("Client", "WARN", true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 
-	if s.whatsAppProxyURL != "" {
-		if err := client.SetProxyAddress(s.whatsAppProxyURL); err != nil {
-			log.Printf("[Valo] Invalid WHATSAPP_PROXY_URL for %s: %v", phoneNumber, err)
+	// Per-account proxy overrides the global WHATSAPP_PROXY_URL so accounts
+	// don't all share one exit IP (shared IPs are a spam flag).
+	proxyURL := s.whatsAppProxyURL
+	var account models.ValoAccount
+	if err := s.db.Where("phone_number = ?", phoneNumber).Select("proxy_url").First(&account).Error; err == nil && account.ProxyURL != "" {
+		proxyURL = account.ProxyURL
+	}
+	if proxyURL != "" {
+		if err := client.SetProxyAddress(proxyURL); err != nil {
+			log.Printf("[Valo] Invalid proxy URL for %s: %v", phoneNumber, err)
 		} else {
-			log.Printf("[Valo] Using proxy for %s", phoneNumber)
+			log.Printf("[Valo] Using proxy %s for %s", proxyURL, phoneNumber)
 		}
 	}
 
@@ -126,10 +170,41 @@ func (s *ValoService) createAndRegisterClient(deviceStore *store.Device, phoneNu
 		switch v := evt.(type) {
 		case *events.Connected:
 			log.Printf("[Valo] Account connected: %s", phoneNumber)
-			s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", phoneNumber).Update("status", "CONNECTED")
+			s.updateStatus(phoneNumber, StatusConnected)
 		case *events.Disconnected:
-			log.Printf("[Valo] Account disconnected: %s", phoneNumber)
-			s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", phoneNumber).Update("status", "DISCONNECTED")
+			// Transient: whatsmeow auto-reconnects (EnableAutoReconnect).
+			log.Printf("[Valo] Account disconnected (will auto-reconnect): %s", phoneNumber)
+			s.updateStatus(phoneNumber, StatusDisconnected)
+		case *events.LoggedOut:
+			// Device removed from the phone / banned for an unknown reason.
+			// Session is dead — delete the store so it must be re-paired.
+			log.Printf("[Valo] Account logged out (%v): %s — device store deleted, re-pair required", v.Reason, phoneNumber)
+			s.removeClient(phoneNumber, client)
+			if client.Store != nil {
+				_ = client.Store.Delete(context.Background())
+			}
+			s.updateStatus(phoneNumber, StatusLoggedOut)
+		case *events.TemporaryBan:
+			log.Printf("[Valo] Account temporarily banned (%v, expires after %s): %s — stop sending on this number until expiry", v.Code, v.Expire, phoneNumber)
+			s.removeClient(phoneNumber, client)
+			s.updateStatus(phoneNumber, StatusTempBanned)
+		case *events.StreamReplaced:
+			// Same device got paired elsewhere — this connection is obsolete.
+			log.Printf("[Valo] Stream replaced (device paired elsewhere): %s", phoneNumber)
+			s.removeClient(phoneNumber, client)
+			s.updateStatus(phoneNumber, StatusLoggedOut)
+		case *events.ClientOutdated:
+			log.Printf("[Valo] whatsmeow client outdated for %s — upgrade the whatsmeow dependency and redeploy", phoneNumber)
+			s.removeClient(phoneNumber, client)
+			s.updateStatus(phoneNumber, StatusDisconnected)
+		case *events.CATRefreshError:
+			log.Printf("[Valo] CAT refresh failed for %s: %v", phoneNumber, v.Error)
+			s.removeClient(phoneNumber, client)
+			s.updateStatus(phoneNumber, StatusDisconnected)
+		case *events.ConnectFailure:
+			log.Printf("[Valo] Connect failure (%v %s): %s", v.Reason, v.Message, phoneNumber)
+			s.removeClient(phoneNumber, client)
+			s.updateStatus(phoneNumber, StatusDisconnected)
 		case *events.Message:
 			if v.Info.IsFromMe {
 				break
@@ -174,6 +249,9 @@ func (s *ValoService) createAndRegisterClient(deviceStore *store.Device, phoneNu
 				}
 			}
 
+			// Mark the message as read — humans do this, bots that never do are a flag.
+			_ = client.MarkRead(context.Background(), []waTypes.MessageID{v.Info.ID}, time.Now(), v.Info.Chat, v.Info.Sender)
+
 			text := v.Message.GetConversation()
 			if text == "" {
 				if ext := v.Message.GetExtendedTextMessage(); ext != nil {
@@ -193,18 +271,14 @@ func (s *ValoService) createAndRegisterClient(deviceStore *store.Device, phoneNu
 			media, mediaSupported := s.extractSupportedMedia(client, v.Message)
 			if (text == "" && len(media) == 0) || (!mediaSupported && text == "") {
 				log.Printf("[Valo] Non-text or unsupported media message received from %s, sending auto-reply notice", senderID)
-				notice := "⚠️ Aria di WhatsApp dapat memproses teks, gambar (JPEG/PNG/WebP), dan dokumen PDF maksimal 5MB. Untuk berkas rekam medis berukuran besar, silakan gunakan website Casemix Pintar."
-				linkMsg := "https://casemixpintar.id"
-				go func(acc, target, msg1, msg2 string) {
-					if err := s.SendMessage(acc, target, msg1, "", "", ""); err != nil {
+				// One combined message — sending the same two-message template to
+				// many users is a classic SentTooManySameMessage spam trigger.
+				notice := "⚠️ Aria di WhatsApp dapat memproses teks, gambar (JPEG/PNG/WebP), dan dokumen PDF maksimal 5MB. Untuk berkas rekam medis berukuran besar, silakan gunakan website Casemix Pintar: https://casemixpintar.id"
+				go func(acc, target, msg string) {
+					if err := s.sendNow(acc, target, msg); err != nil {
 						log.Printf("[Valo] Failed to send media auto-reply notice to %s: %v", target, err)
-					} else {
-						time.Sleep(500 * time.Millisecond)
-						if err := s.SendMessage(acc, target, msg2, "", "", ""); err != nil {
-							log.Printf("[Valo] Failed to send media auto-reply link to %s: %v", target, err)
-						}
 					}
-				}(phoneNumber, senderID, notice, linkMsg)
+				}(phoneNumber, senderID, notice)
 				break
 			}
 
@@ -230,7 +304,124 @@ func (s *ValoService) startClient(deviceStore *store.Device, phoneNumber string)
 	s.clientsMutex.Unlock()
 }
 
+// updateStatus writes the account status; the row may not exist yet mid-pairing.
+func (s *ValoService) updateStatus(phoneNumber, status string) {
+	if err := s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", phoneNumber).Update("status", status).Error; err != nil {
+		log.Printf("[Valo] Failed to update status for %s to %s: %v", phoneNumber, status, err)
+	}
+}
+
+// removeClient drops the client from the live map and disconnects it.
+func (s *ValoService) removeClient(phoneNumber string, client *whatsmeow.Client) {
+	s.clientsMutex.Lock()
+	if c, ok := s.clients[phoneNumber]; ok && c == client {
+		delete(s.clients, phoneNumber)
+	}
+	s.clientsMutex.Unlock()
+	client.Disconnect()
+}
+
+// SyncStatuses reconciles DB statuses with the live clients. Events can be
+// missed (crash, restart), so status is also derived from
+// client.IsConnected()/IsLoggedIn() on demand.
+func (s *ValoService) SyncStatuses() {
+	var accounts []models.ValoAccount
+	s.db.Find(&accounts)
+
+	s.clientsMutex.RLock()
+	defer s.clientsMutex.RUnlock()
+
+	for _, account := range accounts {
+		client, ok := s.clients[account.PhoneNumber]
+		if ok {
+			status := StatusDisconnected
+			if client.IsConnected() && client.IsLoggedIn() {
+				status = StatusConnected
+			}
+			if account.Status != status && account.Status != StatusTempBanned {
+				s.updateStatus(account.PhoneNumber, status)
+			}
+		} else if account.Status == StatusConnected {
+			s.updateStatus(account.PhoneNumber, StatusDisconnected)
+		}
+	}
+}
+
+// resolveClient picks the sending client: explicit sender number, else the
+// default account. No random fallback — blasting through an arbitrary account
+// (e.g. the Aria chatbot number) is what gets numbers spam-flagged.
+func (s *ValoService) resolveClient(senderNumber string) (*whatsmeow.Client, string, error) {
+	s.clientsMutex.RLock()
+	defer s.clientsMutex.RUnlock()
+
+	if senderNumber != "" {
+		if client, ok := s.clients[senderNumber]; ok {
+			return client, senderNumber, nil
+		}
+		return nil, "", fmt.Errorf("sender account %s is not connected", senderNumber)
+	}
+
+	var defAccount models.ValoAccount
+	if err := s.db.Where("is_default = ? AND status = ?", true, StatusConnected).First(&defAccount).Error; err == nil {
+		if client, ok := s.clients[defAccount.PhoneNumber]; ok {
+			return client, defAccount.PhoneNumber, nil
+		}
+	}
+	return nil, "", fmt.Errorf("no sender_number given and no connected default account set")
+}
+
+func (s *ValoService) getPacer(account string) *sendPacer {
+	s.pacersMutex.Lock()
+	defer s.pacersMutex.Unlock()
+	if p, ok := s.pacers[account]; ok {
+		return p
+	}
+	p := &sendPacer{}
+	s.pacers[account] = p
+	return p
+}
+
+// pace blocks until this account is allowed to send again, then reserves the
+// next slot (min gap + jitter). Sleeping while holding the lock is what
+// serializes concurrent sends for the same account.
+func (s *ValoService) pace(account string) {
+	p := s.getPacer(account)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if wait := time.Until(p.next); wait > 0 {
+		time.Sleep(wait)
+	}
+	gap := sendMinGap
+	if sendJitter > 0 {
+		gap += time.Duration(rand.Int63n(int64(sendJitter)))
+	}
+	p.next = time.Now().Add(gap)
+}
+
+// sendNow sends a text message without pacing — used for conversational Aria
+// replies, which must stay fast. Blasts via the public API go through pace().
+func (s *ValoService) sendNow(senderNumber, to, message string) error {
+	client, _, err := s.resolveClient(senderNumber)
+	if err != nil {
+		return err
+	}
+
+	if !strings.Contains(to, "@") {
+		to = to + "@s.whatsapp.net"
+	}
+	targetJID, err := waTypes.ParseJID(to)
+	if err != nil {
+		return err
+	}
+
+	_, err = client.SendMessage(context.Background(), targetJID, &waE2E.Message{
+		Conversation: proto.String(message),
+	})
+	return err
+}
+
 func (s *ValoService) getOrCreateFreshClient(phoneNumber string) (*whatsmeow.Client, error) {
+	phoneNumber = normalizePhoneNumber(phoneNumber)
 	s.clientsMutex.Lock()
 	defer s.clientsMutex.Unlock()
 
@@ -252,7 +443,7 @@ func (s *ValoService) getOrCreateFreshClient(phoneNumber string) (*whatsmeow.Cli
 	if res.Error != nil {
 		account = models.ValoAccount{
 			PhoneNumber: phoneNumber,
-			Status:      "DISCONNECTED",
+			Status:      StatusDisconnected,
 		}
 		s.db.Create(&account)
 	}
@@ -270,7 +461,10 @@ func (s *ValoService) GetQR(phoneNumber string) (string, error) {
 		return "", err
 	}
 
-	qrChan, _ := client.GetQRChannel(context.Background())
+	qrChan, err := client.GetQRChannel(context.Background())
+	if err != nil {
+		return "", err
+	}
 	err = client.Connect()
 	if err != nil {
 		return "", err
@@ -288,7 +482,7 @@ func (s *ValoService) GetQR(phoneNumber string) (string, error) {
 			go func() {
 				for evt := range qrChan {
 					if evt.Event == "success" {
-						s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", phoneNumber).Update("status", "CONNECTED")
+						s.updateStatus(phoneNumber, StatusConnected)
 					}
 				}
 			}()
@@ -308,7 +502,10 @@ func (s *ValoService) GetPairingCode(phoneNumber string) (string, error) {
 		return "", err
 	}
 
-	qrChan, _ := client.GetQRChannel(context.Background())
+	qrChan, err := client.GetQRChannel(context.Background())
+	if err != nil {
+		return "", err
+	}
 	err = client.Connect()
 	if err != nil {
 		return "", err
@@ -325,7 +522,7 @@ func (s *ValoService) GetPairingCode(phoneNumber string) (string, error) {
 			go func() {
 				for evt := range qrChan {
 					if evt.Event == "success" {
-						s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", phoneNumber).Update("status", "CONNECTED")
+						s.updateStatus(phoneNumber, StatusConnected)
 					}
 				}
 			}()
@@ -340,31 +537,13 @@ func (s *ValoService) GetPairingCode(phoneNumber string) (string, error) {
 }
 
 func (s *ValoService) SendMessage(senderNumber string, to string, message string, imageUrl string, imageBase64 string, caption string) error {
-	s.clientsMutex.RLock()
-	var client *whatsmeow.Client
-
-	if senderNumber != "" {
-		client = s.clients[senderNumber]
-	} else {
-		var defAccount models.ValoAccount
-		if err := s.db.Where("is_default = ? AND status = ?", true, "CONNECTED").First(&defAccount).Error; err == nil {
-			client = s.clients[defAccount.PhoneNumber]
-		}
-
-		if client == nil {
-			for _, c := range s.clients {
-				if c.IsConnected() && c.IsLoggedIn() {
-					client = c
-					break
-				}
-			}
-		}
+	client, account, err := s.resolveClient(senderNumber)
+	if err != nil {
+		return err
 	}
-	s.clientsMutex.RUnlock()
-
-	if client == nil {
-		return fmt.Errorf("no connected client available")
-	}
+	// Public API sends are paced per account (min gap + jitter) to avoid
+	// burst-triggered spam flags. Conversational Aria replies use sendNow.
+	s.pace(account)
 
 	if !strings.Contains(to, "@") {
 		to = to + "@s.whatsapp.net"
@@ -468,6 +647,7 @@ func (s *ValoService) SendMessage(senderNumber string, to string, message string
 }
 
 func (s *ValoService) Logout(phoneNumber string) error {
+	phoneNumber = normalizePhoneNumber(phoneNumber)
 	s.clientsMutex.Lock()
 	client, exists := s.clients[phoneNumber]
 	if exists {
@@ -481,9 +661,20 @@ func (s *ValoService) Logout(phoneNumber string) error {
 		if client.Store != nil {
 			_ = client.Store.Delete(context.Background())
 		}
+	} else {
+		// No live client (e.g. after a restart) — still clean up the stored
+		// session so device rows don't orphan in the whatsmeow tables.
+		devices, err := s.container.GetAllDevices(context.Background())
+		if err == nil {
+			for _, device := range devices {
+				if device.ID != nil && normalizePhoneNumber(device.ID.User) == phoneNumber {
+					_ = device.Delete(context.Background())
+				}
+			}
+		}
 	}
 
-	s.db.Model(&models.ValoAccount{}).Where("phone_number = ?", phoneNumber).Update("status", "DISCONNECTED")
+	s.updateStatus(phoneNumber, StatusDisconnected)
 	return nil
 }
 
@@ -656,7 +847,7 @@ func (s *ValoService) forwardToGrupia(senderAccount, fromNumber, text string, me
 
 	if webhookResp.Reply != "" {
 		// Send the AI text reply back to the WhatsApp sender
-		if err := s.SendMessage(senderAccount, fromNumber, webhookResp.Reply, "", "", ""); err != nil {
+		if err := s.sendNow(senderAccount, fromNumber, webhookResp.Reply); err != nil {
 			log.Printf("[Aria-WA] Failed to send reply to %s: %v", fromNumber, err)
 		}
 	}
@@ -678,29 +869,9 @@ func (s *ValoService) forwardToGrupia(senderAccount, fromNumber, text string, me
 
 // SendDocument sends a document attachment (e.g. Excel spreadsheet) via WhatsApp
 func (s *ValoService) SendDocument(senderNumber string, to string, docBytes []byte, fileName string, caption string) error {
-	s.clientsMutex.RLock()
-	var client *whatsmeow.Client
-
-	if senderNumber != "" {
-		client = s.clients[senderNumber]
-	} else {
-		var defAccount models.ValoAccount
-		if err := s.db.Where("is_default = ? AND status = ?", true, "CONNECTED").First(&defAccount).Error; err == nil {
-			client = s.clients[defAccount.PhoneNumber]
-		}
-		if client == nil {
-			for _, c := range s.clients {
-				if c.IsConnected() && c.IsLoggedIn() {
-					client = c
-					break
-				}
-			}
-		}
-	}
-	s.clientsMutex.RUnlock()
-
-	if client == nil {
-		return fmt.Errorf("no connected client available")
+	client, _, err := s.resolveClient(senderNumber)
+	if err != nil {
+		return err
 	}
 
 	if !strings.Contains(to, "@") {
