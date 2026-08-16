@@ -187,9 +187,13 @@ func (s *ValoService) createAndRegisterClient(deviceStore *store.Device, phoneNu
 				}
 			}
 
-			if text == "" {
-				log.Printf("[Valo] Non-text or empty media message received from %s, sending auto-reply notice", senderID)
-				notice := "⚠️ Saat ini Aria di WhatsApp hanya dapat memproses pesan berupa teks. Untuk mengunggah dan menganalisis berkas rekam medis/PDF, silakan kunjungi website Casemix Pintar."
+			// Supported media (PDF/gambar) is downloaded and forwarded to Grupia
+			// alongside the caption. Unsupported media types keep the old
+			// text-only behavior.
+			media, mediaSupported := s.extractSupportedMedia(client, v.Message)
+			if (text == "" && len(media) == 0) || (!mediaSupported && text == "") {
+				log.Printf("[Valo] Non-text or unsupported media message received from %s, sending auto-reply notice", senderID)
+				notice := "⚠️ Aria di WhatsApp dapat memproses teks, gambar (JPEG/PNG/WebP), dan dokumen PDF maksimal 5MB. Untuk berkas rekam medis berukuran besar, silakan gunakan website Casemix Pintar."
 				linkMsg := "https://casemixpintar.id"
 				go func(acc, target, msg1, msg2 string) {
 					if err := s.SendMessage(acc, target, msg1, "", "", ""); err != nil {
@@ -204,8 +208,8 @@ func (s *ValoService) createAndRegisterClient(deviceStore *store.Device, phoneNu
 				break
 			}
 
-			log.Printf("[Aria-WA] Forwarding message from %s to Grupia API: %q", senderID, text)
-			go s.forwardToGrupia(phoneNumber, senderID, text)
+			log.Printf("[Aria-WA] Forwarding message from %s to Grupia API: %q (media: %d)", senderID, text, len(media))
+			go s.forwardToGrupia(phoneNumber, senderID, text, media)
 		}
 	})
 
@@ -483,9 +487,92 @@ func (s *ValoService) Logout(phoneNumber string) error {
 	return nil
 }
 
-// forwardToGrupia sends an incoming WhatsApp message to Grupia API for Aria processing
-// and sends the AI reply back to the sender.
-func (s *ValoService) forwardToGrupia(senderAccount, fromNumber, text string) {
+// forwardMedia is one media item forwarded to the Grupia webhook.
+type forwardMedia struct {
+	MimeType string `json:"mime_type"`
+	Filename string `json:"filename"`
+	Base64   string `json:"base64"`
+}
+
+var valoSupportedMediaMimes = map[string]bool{
+	"application/pdf": true,
+	"image/jpeg":      true,
+	"image/png":       true,
+	"image/webp":      true,
+}
+
+const valoMaxForwardMediaSize = 5 * 1024 * 1024 // must match Grupia's AriaMaxAttachmentSize
+
+// normalizeWAMime lowercases a WhatsApp mimetype and strips parameters
+// (e.g. "application/PDF; name=x.pdf" → "application/pdf").
+func normalizeWAMime(mime string) string {
+	mime = strings.ToLower(strings.TrimSpace(mime))
+	if idx := strings.Index(mime, ";"); idx != -1 {
+		mime = mime[:idx]
+	}
+	return mime
+}
+
+// extractSupportedMedia downloads supported media (images, PDF documents)
+// from an incoming WhatsApp message. Returns (media, supported): supported
+// reports whether the media type is one we handle — when false the caller
+// falls back to text-only forwarding (or the notice when there is no text).
+func (s *ValoService) extractSupportedMedia(client *whatsmeow.Client, msg *waE2E.Message) ([]forwardMedia, bool) {
+	if img := msg.GetImageMessage(); img != nil {
+		mime := normalizeWAMime(img.GetMimetype())
+		if mime == "" {
+			mime = "image/jpeg" // WhatsApp re-encodes images to JPEG by default
+		}
+		ext := ".jpg"
+		switch mime {
+		case "image/png":
+			ext = ".png"
+		case "image/webp":
+			ext = ".webp"
+		}
+		return s.downloadAsForwardMedia(client, img, mime, fmt.Sprintf("gambar_wa_%d%s", time.Now().Unix(), ext), img.GetFileLength())
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		mime := normalizeWAMime(doc.GetMimetype())
+		if mime == "" {
+			mime = "application/pdf"
+		}
+		if mime != "application/pdf" {
+			return nil, false // non-PDF documents are not supported downstream
+		}
+		name := doc.GetFileName()
+		if name == "" {
+			name = fmt.Sprintf("dokumen_wa_%d.pdf", time.Now().Unix())
+		}
+		return s.downloadAsForwardMedia(client, doc, mime, name, doc.GetFileLength())
+	}
+	if msg.GetVideoMessage() != nil || msg.GetAudioMessage() != nil || msg.GetStickerMessage() != nil {
+		return nil, false
+	}
+	return nil, true // no media at all — plain text message
+}
+
+func (s *ValoService) downloadAsForwardMedia(client *whatsmeow.Client, dl whatsmeow.DownloadableMessage, mime, filename string, fileLength uint64) ([]forwardMedia, bool) {
+	if !valoSupportedMediaMimes[mime] {
+		return nil, false
+	}
+	if fileLength > valoMaxForwardMediaSize {
+		log.Printf("[Valo] Skipping media %s: %d bytes exceeds %d limit", filename, fileLength, valoMaxForwardMediaSize)
+		return nil, false
+	}
+	data, err := client.Download(context.Background(), dl)
+	if err != nil {
+		// Download failure degrades to text-only forwarding, not a hard error.
+		log.Printf("[Valo] Failed to download media %s: %v", filename, err)
+		return nil, true
+	}
+	log.Printf("[Valo] Downloaded media %s (%s, %d bytes)", filename, mime, len(data))
+	return []forwardMedia{{MimeType: mime, Filename: filename, Base64: base64.StdEncoding.EncodeToString(data)}}, true
+}
+
+// forwardToGrupia sends an incoming WhatsApp message (text + optional media)
+// to Grupia API for Aria processing and sends the AI reply back to the sender.
+func (s *ValoService) forwardToGrupia(senderAccount, fromNumber, text string, media []forwardMedia) {
 	if s.grupiaAPIURL == "" {
 		log.Println("[Aria-WA] GRUPIA_API_URL not configured, skipping forward")
 		return
@@ -511,10 +598,16 @@ func (s *ValoService) forwardToGrupia(senderAccount, fromNumber, text string) {
 		}()
 	}
 
-	payload := map[string]string{
-		"from":           fromNumber,
-		"message":        text,
-		"sender_account": senderAccount,
+	payload := struct {
+		From          string         `json:"from"`
+		Message       string         `json:"message"`
+		SenderAccount string         `json:"sender_account"`
+		Media         []forwardMedia `json:"media,omitempty"`
+	}{
+		From:          fromNumber,
+		Message:       text,
+		SenderAccount: senderAccount,
+		Media:         media,
 	}
 	bodyData, err := json.Marshal(payload)
 	if err != nil {
