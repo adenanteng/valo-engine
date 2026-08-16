@@ -692,7 +692,10 @@ var valoSupportedMediaMimes = map[string]bool{
 	"image/webp":      true,
 }
 
-const valoMaxForwardMediaSize = 5 * 1024 * 1024 // must match Grupia's AriaMaxAttachmentSize
+// Must match Grupia's AriaMaxAttachmentSize (5MB raw) — the product cap for
+// chat attachments. Grupia inlines the file into one Gemini request; base64
+// expands 4/3×, so keeping well under Gemini's ~20MB request limit.
+const valoMaxForwardMediaSize = 5 * 1024 * 1024
 
 // normalizeWAMime lowercases a WhatsApp mimetype and strips parameters
 // (e.g. "application/PDF; name=x.pdf" → "application/pdf").
